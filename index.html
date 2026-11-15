@@ -93,7 +93,7 @@
 
 <div id="lobby">
   <h1>⚫ 好友對弈 🔴</h1>
-  <p class="sub">圍棋、象棋、暗棋。開房間，把房間碼給朋友就能連線下棋。</p>
+  <p class="sub">圍棋、象棋、暗棋。開房間，把房間碼給朋友就能連線下棋。<span id="verTag" style="font-size:11px;opacity:.6"></span></p>
 
   <div class="card">
     <label for="myName" style="margin-top:0">你的名字</label>
@@ -171,7 +171,7 @@
       <form id="chatForm"><input id="chatInput" maxlength="200" placeholder="說點什麼…" autocomplete="off"><button>送出</button></form>
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-      <div id="conn"><span class="dot"></span><span id="connText">未連線</span></div>
+      <div id="conn" style="cursor:pointer" title="點一下看連線詳情"><span class="dot"></span><span id="connText">未連線</span></div>
       <span style="display:flex;gap:6px"><button class="small" id="inviteBtn">邀請連結</button><button class="small" id="leaveBtn">離開房間</button></span>
     </div>
     <div style="display:flex;justify-content:flex-end">
@@ -447,6 +447,8 @@ const BQ = (() => {
 const $ = id => document.getElementById(id);
 const COLS = 'ABCDEFGHJKLMNOPQRST';
 const PREFIX = 'friendgo-tw-';
+const VERSION = '2026-11-15c';
+let attempts = 0, timeouts = 0, lastErr = '', lastErrAt = 0, tries = [];
 const GAME_NAME = { go:'圍棋', xq:'象棋', bq:'暗棋' };
 const XQ_CH = { 1:{K:'帥',A:'仕',E:'相',H:'傌',R:'俥',C:'炮',P:'兵'}, 2:{K:'將',A:'士',E:'象',H:'馬',R:'車',C:'包',P:'卒'} };
 const RULES = {
@@ -619,9 +621,18 @@ function openGuestPeer(){
 }
 function connectToHost(){
   if (!peer || peer.destroyed || peer.disconnected || !peer.open || !roomCode) return;
-  if (connecting && Date.now() - connecting.t < 8000) return;
+  // 同時保留最多 3 個嘗試：手機網路建立連線可能要 10 秒以上，不要急著砸掉；但每 6 秒補一個新的，避免卡在送丟的那次
+  const now = Date.now();
+  tries = tries.filter(p => {
+    if (now - p.t < 20000) return true;
+    timeouts++; try{ p.c.close(); }catch(e){} return false;
+  });
+  if (timeouts >= 6){ timeouts = 0; rebuildPeer(); return; }  // 一直沒回應，才把自己的連線整個重建
+  if (tries.length >= 3 || (tries.length && now - tries[tries.length - 1].t < 6000)) return;
+  attempts++;
   const c = peer.connect(PREFIX + roomCode, { reliable:true });
-  connecting = { c, t: Date.now() };
+  connecting = { c, t: now }; tries.push(connecting);
+  if (G) setConn(false, (lastErr.startsWith('peer-unavailable') && Date.now() - lastErrAt < 20000 ? '房主可能暫時離開頁面，回來後會自動連上' : '重新連線中…') + `（第 ${attempts} 次嘗試）`);
   bindConn(c, false);
 }
 // 定期檢查連線，斷了就自動補上
@@ -634,9 +645,11 @@ function ensureLink(){
   connectToHost();
 }
 function handlePeerError(e){
+  lastErr = e.type + ' @' + new Date().toLocaleTimeString();
+  lastErrAt = Date.now();
   $('joinBtn').disabled = false; $('createBtn').disabled = false;
   if (e.type === 'peer-unavailable'){
-    connecting = null;
+    connecting = null; tries = [];
     if (G) setConn(false, '房主可能暫時離開頁面，回來後會自動連上…');
     else { lobbyErr('找不到這個房間，請確認房間碼，或請房主重新開房。'); roomCode = ''; }
   } else if (['network','server-error','socket-error','socket-closed','disconnected'].includes(e.type)){
@@ -649,12 +662,13 @@ function bindConn(c, incoming){
   c.on('open', () => {
     if (incoming) return;            // 房主等對方送 hello 才接受
     if (conn && conn !== c){ const old = conn; conn = null; try{ old.close(); }catch(e){} }
-    conn = c; connecting = null; lastRecv = Date.now(); setConn(true);
+    for (const p of tries) if (p.c !== c){ try{ p.c.close(); }catch(e){} }
+    tries = []; conn = c; connecting = null; attempts = 0; timeouts = 0; lastRecv = Date.now(); setConn(true);
     send({ t:'hello', name: G ? G.names[G.mySeat] : myName(), cid: CID, game: G ? gameData() : null });
   });
   c.on('data', m => onMsg(m, c));
   c.on('close', () => {
-    if (connecting && connecting.c === c) connecting = null;
+    if (connecting && connecting.c === c) connecting = null; tries = tries.filter(p => p.c !== c);
     if (conn === c){
       conn = null;
       setConn(false, isHost ? '朋友斷線了，等待重新連線…' : '連線中斷，自動重新連線中…');
@@ -678,7 +692,7 @@ function snapshot(){
 // 整個連線重建（手機切到背景太久，連線伺服器那邊常常已經斷了，但網頁自己不知道）
 function rebuildPeer(){
   if (!roomCode) return;
-  lastRebuild = Date.now(); connecting = null;
+  lastRebuild = Date.now(); connecting = null; tries = [];
   if (conn){ const old = conn; conn = null; try{ old.close(); }catch(e){} }
   if (G) setConn(false, isHost ? '正在恢復房間…' : '重新連線中…');
   if (isHost) openHostPeer(roomCode, false); else openGuestPeer();
@@ -694,7 +708,9 @@ setInterval(() => {
       setConn(false, '連線不穩，重新連線中…');
     }
   }
-  if (G && !(conn && conn.open) && downSince && now - downSince > 20000 && now - lastRebuild > 30000){ rebuildPeer(); return; }
+  // 只有自己跟連線伺服器的連線真的壞了，才整個重建（不要週期性重建，會把正在建立中的連線砸掉）
+  if (G && !(conn && conn.open) && peer && now - lastRebuild > 30000 &&
+      (peer.destroyed || (peer.disconnected && downSince && now - downSince > 30000))){ rebuildPeer(); return; }
   ensureLink();
 }, 4000);
 document.addEventListener('visibilitychange', () => {
@@ -770,6 +786,25 @@ function onMsg(m, c){
     case 'rematch': if (isHost) startRematch(); break;
   }
 }
+
+/* ---------- 連線詳情（排查用） ---------- */
+$('verTag').textContent = '　版本 ' + VERSION;
+$('conn').onclick = () => {
+  const yn = v => v ? '是' : '否';
+  let ice = '—';
+  try{ const pc = (conn || (connecting && connecting.c) || {}).peerConnection; if (pc) ice = pc.iceConnectionState + ' / ' + pc.connectionState; }catch(e){}
+  const lines = [
+    `版本：${VERSION}`,
+    `身分：${isHost ? '房主' : '加入者'}　房間：${roomCode || '—'}`,
+    `連線伺服器：${peer ? (peer.destroyed ? '已關閉' : peer.disconnected ? '斷開' : peer.open ? '正常' : '連線中') : '—'}`,
+    `與對方連線：${conn && conn.open ? '已連上' : '未連上'}　嘗試 ${attempts} 次、逾時 ${timeouts} 次`,
+    `網路狀態（ICE）：${ice}`,
+    `最後錯誤：${lastErr || '無'}`,
+    `最後收到對方訊息：${lastRecv ? Math.round((Date.now() - lastRecv) / 1000) + ' 秒前' : '—'}`
+  ];
+  showModal('連線詳情', lines.join('\n'), null, '關閉', false);
+};
+$('mText').style.whiteSpace = 'pre-line';
 
 /* ---------- 房間內的按鈕 ---------- */
 $('inviteBtn').onclick = () => copyLink($('inviteBtn'), '邀請連結');
