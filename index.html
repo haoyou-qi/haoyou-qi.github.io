@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>好友對弈 · 圍棋 象棋 暗棋</title>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>if (!window.mqtt) document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"><\/script>');</script>
 <style>
   :root{
     --bg:#f4efe6; --panel:#fffdf8; --ink:#2b2622; --muted:#7a6f63; --line:#e3d9c8;
@@ -129,7 +130,7 @@
   <div id="joinCard" class="card">
     <h2>加入朋友的房間</h2>
     <label for="joinCode">房間碼</label>
-    <input id="joinCode" maxlength="6" placeholder="輸入 5 碼房間碼" autocapitalize="characters" style="text-transform:uppercase;letter-spacing:4px">
+    <input id="joinCode" maxlength="8" placeholder="輸入 6 碼房間碼" autocapitalize="characters" style="text-transform:uppercase;letter-spacing:4px">
     <div class="btnrow"><button class="primary" id="joinBtn">加入</button></div>
   </div>
 
@@ -446,9 +447,7 @@ const BQ = (() => {
 /* ==================== UI / NETWORK ==================== */
 const $ = id => document.getElementById(id);
 const COLS = 'ABCDEFGHJKLMNOPQRST';
-const PREFIX = 'friendgo-tw-';
-const VERSION = '2026-11-15c';
-let attempts = 0, timeouts = 0, lastErr = '', lastErrAt = 0, tries = [];
+const VERSION = '2026-11-15d';
 const GAME_NAME = { go:'圍棋', xq:'象棋', bq:'暗棋' };
 const XQ_CH = { 1:{K:'帥',A:'仕',E:'相',H:'傌',R:'俥',C:'炮',P:'兵'}, 2:{K:'將',A:'士',E:'象',H:'馬',R:'車',C:'包',P:'卒'} };
 const RULES = {
@@ -457,16 +456,22 @@ const RULES = {
   bq:'台灣常見規則：第一次翻到的顏色就是你的顏色；炮要隔一子吃；兵卒可吃帥將，帥將不能吃兵卒。連續 60 步沒吃子也沒翻棋算和局。'
 };
 const SEAT_LABEL = { go:{1:'黑（先手）',2:'白'}, xq:{1:'紅（先手）',2:'黑'}, bq:{1:'先手',2:'後手'} };
+// 三個免費公共轉送站同時連，任何一個通就能下
+const BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
 
-let peer = null, conn = null, isHost = false, roomCode = '';
-let G = null;
+let roomCode = '', isHost = false, joining = false;
+let G = null;   // 本機正在顯示的對局
+let R = null;   // 房間狀態（存在轉送站上）：{ rev, by, t, gid, players:{1:{cid,name},2:{cid,name}}, game:{type,size,setup,history,phase,dead,agree} }
 let pending = null, hover = null, sel = null;
 let selGame = 'go', selSize = 19, selColor = 1;
+let clients = [], topicBase = '', aesKey = null, seen = new Set(), lastSeenPeer = 0, joinTimer = null, lastErr = '', hiddenAt = 0;
 
 function store(k, v){ try{ localStorage.setItem(k, v); }catch(e){} }
 function load(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+const CID = load('qi_cid') || (() => { const v = Math.random().toString(36).slice(2, 10); store('qi_cid', v); return v; })();
 function myName(){ return ($('myName').value.trim() || (isHost ? '房主' : '朋友')).slice(0,12); }
-function genCode(){ const a='ABCDEFGHJKMNPQRSTUVWXYZ23456789'; let s=''; for(let i=0;i<5;i++) s+=a[Math.floor(Math.random()*a.length)]; return s; }
+function rid(n=10){ return Math.random().toString(36).slice(2, 2+n); }
+function genCode(){ const a='ABCDEFGHJKMNPQRSTUVWXYZ23456789'; const r = crypto.getRandomValues(new Uint8Array(6)); return [...r].map(v => a[v % a.length]).join(''); }
 function coordName(x, y, n){ return COLS[x] + (n - y); }
 function colorName(c){ return c === BLACK ? '黑' : '白'; }
 function seatSide(seat){
@@ -474,7 +479,6 @@ function seatSide(seat){
   if (G.type === 'xq') return seat === 1 ? '紅' : '黑';
   const c = G.st.seatColor[seat]; return c ? (c === 1 ? '紅' : '黑') : (seat === 1 ? '先手' : '後手');
 }
-
 function showModal(title, text, onOk, okText='確定', showCancel=true){
   $('mTitle').textContent = title; $('mText').textContent = text;
   $('mOk').textContent = okText; $('mCancel').classList.toggle('hidden', !showCancel);
@@ -482,7 +486,7 @@ function showModal(title, text, onOk, okText='確定', showCancel=true){
   $('mOk').onclick = () => { $('modal').classList.add('hidden'); onOk && onOk(); };
   $('mCancel').onclick = () => $('modal').classList.add('hidden');
 }
-
+$('mText').style.whiteSpace = 'pre-line';
 let actx = null;
 function clack(high){
   try{
@@ -516,44 +520,25 @@ $('myName').value = load('go_name') || '';
 $('myName').oninput = () => store('go_name', $('myName').value.trim());
 $('confirmTap').checked = load('go_confirm') !== null ? load('go_confirm') === '1' : matchMedia('(pointer:coarse)').matches;
 $('confirmTap').onchange = () => { store('go_confirm', $('confirmTap').checked ? '1' : '0'); pending = null; draw(); };
-
 function lobbyErr(t){ $('lobbyErr').textContent = t || ''; }
-function needPeerJS(){
-  if (typeof Peer === 'undefined'){ lobbyErr('連線元件載入失敗，請確認網路後重新整理頁面。'); return false; }
+function needMQTT(){
+  if (typeof mqtt === 'undefined' || !window.crypto || !crypto.subtle){ lobbyErr('連線元件載入失敗，請確認網路後重新整理頁面。'); return false; }
   return true;
 }
-/* ---------- session (存在本機，斷線或重新整理後可回到房間) ---------- */
-const CID = load('qi_cid') || (() => { const v = Math.random().toString(36).slice(2, 10); store('qi_cid', v); return v; })();
-let lastRecv = 0, guestCid = null, connecting = null, hostRetry = 0;
-const SESSION_TTL = 24 * 3600e3;
 
-function gameData(){
-  return { type:G.type, size:G.size, setup:G.setup, history:G.history, names:G.names, mySeat:G.mySeat,
-           phase:G.phase, dead:[...G.dead], agree:G.agree };
-}
+/* ---------- 本機保存（重新整理或關掉後可回到房間） ---------- */
+const SESSION_TTL = 3 * 24 * 3600e3;
 function saveSession(){
   if (!roomCode) return;
-  const s = { code:roomCode, role: isHost ? 'host' : 'guest', t: Date.now(), name: myName() };
-  if (G) s.game = gameData();
-  store('qi_session', JSON.stringify(s));
+  store('qi_session', JSON.stringify({ code:roomCode, host:isHost, t:Date.now(), name:myName(), R }));
 }
 function loadSession(){
   try{ const s = JSON.parse(load('qi_session') || 'null'); if (s && s.code && Date.now() - s.t < SESSION_TTL) return s; }catch(e){}
   return null;
 }
 function clearSession(){ try{ localStorage.removeItem('qi_session'); }catch(e){} }
-function setHash(){ if (!roomCode) return; try{ window.history.replaceState(null, '', location.pathname + location.search + '#' + roomCode); }catch(e){} }
+function setHashFor(code){ try{ window.history.replaceState(null, '', location.pathname + location.search + '#' + code); }catch(e){} }
 function clearHash(){ try{ window.history.replaceState(null, '', location.pathname + location.search); }catch(e){} }
-function restoreGame(g, mySeat){
-  startGame(g.type || 'go', g.size, mySeat, { ...g.names }, g.history || [], g.setup);
-  if (G.type === 'go'){
-    G.dead = new Set(g.dead || []); G.agree = g.agree || {1:false,2:false};
-    if (g.phase === 'play' && G.st.passes >= 2){ G.phase = 'play'; G.st.passes = 0; }
-    else if (g.phase === 'over' && !G.st.over){ G.phase = 'over'; finishScore(); }
-    else if (g.phase === 'score') G.phase = 'score';
-  }
-  render();
-}
 function inviteLink(){ return location.href.split('#')[0] + '#' + roomCode; }
 function copyLink(btn, label){
   const link = inviteLink();
@@ -562,263 +547,239 @@ function copyLink(btn, label){
   else prompt('複製這個連結：', link);
 }
 
-/* ---------- 房主 ---------- */
-$('createBtn').onclick = () => {
-  if (!needPeerJS()) return;
-  lobbyErr(''); isHost = true; $('createBtn').disabled = true;
-  openHostPeer(genCode(), true);
-};
-function showWaitBox(){
-  $('roomCode').textContent = roomCode;
-  $('createCard').classList.add('hidden'); $('joinCard').classList.add('hidden'); $('resumeCard').classList.add('hidden');
-  $('waitBox').classList.remove('hidden'); $('createBtn').disabled = false;
+/* ---------- 加密：房間碼當鑰匙，轉送站上只看得到亂碼 ---------- */
+const enc = new TextEncoder(), dec = new TextDecoder();
+async function sha256(s){ return new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(s))); }
+async function roomKeys(code){
+  const h = await sha256('haoyouqi-topic:' + code);
+  topicBase = 'hq7/' + [...h.slice(0, 16)].map(b => b.toString(16).padStart(2, '0')).join('');
+  aesKey = await crypto.subtle.importKey('raw', await sha256('haoyouqi-key:' + code), 'AES-GCM', false, ['encrypt', 'decrypt']);
 }
-function openHostPeer(code, fresh){
-  roomCode = code;
-  if (peer){ try{ peer.destroy(); }catch(e){} }
-  const p = peer = new Peer(PREFIX + code);
-  p.on('open', () => {
-    hostRetry = 0;
-    if (!G) showWaitBox(); else setConn(!!(conn && conn.open), '房間已恢復，等待朋友連回來…');
-    setHash(); saveSession();
-  });
-  p.on('connection', c => bindConn(c, true));
-  p.on('error', e => {
-    if (p !== peer) return;
-    if (e.type === 'unavailable-id'){
-      if (fresh && !G){ openHostPeer(genCode(), true); return; }
-      // 舊的連線還沒被伺服器釋放，稍後再試
-      if (G) setConn(false, '正在恢復房間…'); else lobbyErr('正在恢復房間…');
-      if (++hostRetry < 60) setTimeout(() => { if (peer === p) openHostPeer(code, false); }, 3000);
-      else { if (G) setConn(false, '無法恢復房間，請按「離開房間」後重新開房'); else lobbyErr('無法恢復房間，請重新開房'); }
-      return;
-    }
-    handlePeerError(e);
-  });
-  p.on('disconnected', () => setTimeout(() => { try{ if (peer === p && !p.destroyed && p.disconnected) p.reconnect(); }catch(e){} }, 1000));
+function b64(u8){ let s = ''; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192)); return btoa(s); }
+function unb64(s){ const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+async function seal(obj){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name:'AES-GCM', iv }, aesKey, enc.encode(JSON.stringify(obj))));
+  const all = new Uint8Array(12 + ct.length); all.set(iv); all.set(ct, 12); return b64(all);
 }
-$('cancelBtn').onclick = () => {
-  if (peer){ try{ peer.destroy(); }catch(e){} } peer = null; isHost = false; roomCode = '';
-  clearSession(); clearHash();
-  $('waitBox').classList.add('hidden'); $('createCard').classList.remove('hidden'); $('joinCard').classList.remove('hidden');
-};
-$('copyLinkBtn').onclick = () => copyLink($('copyLinkBtn'), '複製邀請連結');
-
-/* ---------- 加入者 ---------- */
-$('joinBtn').onclick = () => {
-  if (!needPeerJS()) return;
-  const code = $('joinCode').value.trim().toUpperCase();
-  if (code.length < 4){ lobbyErr('請輸入房間碼'); return; }
-  lobbyErr('連線中…'); isHost = false; roomCode = code; $('joinBtn').disabled = true;
-  openGuestPeer();
-};
-function openGuestPeer(){
-  if (peer){ try{ peer.destroy(); }catch(e){} }
-  const p = peer = new Peer();
-  p.on('open', () => connectToHost());
-  p.on('error', e => { if (p === peer) handlePeerError(e); });
-  p.on('disconnected', () => setTimeout(() => { try{ if (peer === p && !p.destroyed && p.disconnected) p.reconnect(); }catch(e){} }, 1000));
-}
-function connectToHost(){
-  if (!peer || peer.destroyed || peer.disconnected || !peer.open || !roomCode) return;
-  // 同時保留最多 3 個嘗試：手機網路建立連線可能要 10 秒以上，不要急著砸掉；但每 6 秒補一個新的，避免卡在送丟的那次
-  const now = Date.now();
-  tries = tries.filter(p => {
-    if (now - p.t < 20000) return true;
-    timeouts++; try{ p.c.close(); }catch(e){} return false;
-  });
-  if (timeouts >= 6){ timeouts = 0; rebuildPeer(); return; }  // 一直沒回應，才把自己的連線整個重建
-  if (tries.length >= 3 || (tries.length && now - tries[tries.length - 1].t < 6000)) return;
-  attempts++;
-  const c = peer.connect(PREFIX + roomCode, { reliable:true });
-  connecting = { c, t: now }; tries.push(connecting);
-  if (G) setConn(false, (lastErr.startsWith('peer-unavailable') && Date.now() - lastErrAt < 20000 ? '房主可能暫時離開頁面，回來後會自動連上' : '重新連線中…') + `（第 ${attempts} 次嘗試）`);
-  bindConn(c, false);
-}
-// 定期檢查連線，斷了就自動補上
-function ensureLink(){
-  if (!roomCode || !peer) return;
-  if (isHost){ if (!peer.destroyed && peer.disconnected){ try{ peer.reconnect(); }catch(e){} } return; }
-  if (conn && conn.open) return;
-  if (peer.destroyed){ openGuestPeer(); return; }
-  if (peer.disconnected){ try{ peer.reconnect(); }catch(e){} return; }
-  connectToHost();
-}
-function handlePeerError(e){
-  lastErr = e.type + ' @' + new Date().toLocaleTimeString();
-  lastErrAt = Date.now();
-  $('joinBtn').disabled = false; $('createBtn').disabled = false;
-  if (e.type === 'peer-unavailable'){
-    connecting = null; tries = [];
-    if (G) setConn(false, '房主可能暫時離開頁面，回來後會自動連上…');
-    else { lobbyErr('找不到這個房間，請確認房間碼，或請房主重新開房。'); roomCode = ''; }
-  } else if (['network','server-error','socket-error','socket-closed','disconnected'].includes(e.type)){
-    if (G) setConn(false, '網路中斷，自動重新連線中…'); else lobbyErr('連線伺服器失敗，請稍後再試。');
-  } else if (!G) lobbyErr('連線錯誤：' + e.type);
+async function unseal(str){
+  try{ const all = unb64(str); const pt = await crypto.subtle.decrypt({ name:'AES-GCM', iv: all.subarray(0, 12) }, aesKey, all.subarray(12)); return JSON.parse(dec.decode(pt)); }
+  catch(e){ return null; }
 }
 
-/* ---------- 連線 ---------- */
-function bindConn(c, incoming){
-  c.on('open', () => {
-    if (incoming) return;            // 房主等對方送 hello 才接受
-    if (conn && conn !== c){ const old = conn; conn = null; try{ old.close(); }catch(e){} }
-    for (const p of tries) if (p.c !== c){ try{ p.c.close(); }catch(e){} }
-    tries = []; conn = c; connecting = null; attempts = 0; timeouts = 0; lastRecv = Date.now(); setConn(true);
-    send({ t:'hello', name: G ? G.names[G.mySeat] : myName(), cid: CID, game: G ? gameData() : null });
-  });
-  c.on('data', m => onMsg(m, c));
-  c.on('close', () => {
-    if (connecting && connecting.c === c) connecting = null; tries = tries.filter(p => p.c !== c);
-    if (conn === c){
-      conn = null;
-      setConn(false, isHost ? '朋友斷線了，等待重新連線…' : '連線中斷，自動重新連線中…');
-      sysChat('連線中斷'); if (!isHost) setTimeout(ensureLink, 1500);
-    }
-  });
-  c.on('error', () => {});
+/* ---------- 轉送站連線 ---------- */
+function online(){ return clients.some(c => c.connected); }
+function peerOnline(){ return Date.now() - lastSeenPeer < 25000; }
+function disconnectRoom(){ for (const c of clients){ try{ c.end(true); }catch(e){} } clients = []; }
+function connectRoom(){
+  disconnectRoom();
+  const subs = [topicBase + '/state', topicBase + '/ev'];
+  clients = BROKERS.map(url => {
+    let c;
+    try{ c = mqtt.connect(url, { clientId:'hq' + CID + rid(4), keepalive:20, reconnectPeriod:3000, connectTimeout:10000, clean:true }); }
+    catch(e){ lastErr = String(e.message || e); return null; }
+    c.__url = url; c.__rev = -1;
+    c.on('connect', () => {
+      c.__rev = -1;
+      c.subscribe(subs, { qos:0 });
+      updateConn();
+      sendEv({ t:'hello' }, c);   // 對方收到會回應，馬上知道彼此在線
+      // 等一下轉送站上的棋局；如果轉送站上的比較舊（或沒有），就把自己的補上去
+      setTimeout(() => { if (R && c.connected && c.__rev < R.rev) publishState(c); }, 2500);
+    });
+    for (const ev of ['close', 'offline', 'end']) c.on(ev, updateConn);
+    c.on('error', e => { lastErr = (e && e.message) || String(e); });
+    c.on('message', (topic, payload) => onRaw(c, topic, payload.toString()));
+    return c;
+  }).filter(Boolean);
+  updateConn();
 }
-let downSince = 0, lastRebuild = 0, hiddenAt = 0;
-function setConn(on, text){
-  if (on) downSince = 0; else if (!downSince) downSince = Date.now();
-  $('conn').className = on ? 'on' : 'off';
-  $('connText').textContent = on ? '已連線 · 房間 ' + roomCode : (text || '未連線');
-  if (G) render();
+async function publishState(only){
+  if (!R || !aesKey) return;
+  const payload = await seal(R);
+  for (const c of (only ? [only] : clients)) if (c.connected){ try{ c.publish(topicBase + '/state', payload, { qos:0, retain:true }); c.__rev = Math.max(c.__rev, R.rev); }catch(e){} }
 }
-function send(o){ if (conn && conn.open){ try{ conn.send(o); }catch(e){} } }
-function snapshot(){
-  return { t:'sync', type:G.type, size:G.size, setup:G.setup, history:G.history, names:G.names, hostSeat:G.mySeat,
-           phase:G.phase, dead:[...G.dead], agree:G.agree };
+async function sendEv(obj, only){
+  if (!aesKey) return;
+  obj.id = obj.id || rid(); obj.from = CID; seen.add(obj.id);
+  const payload = await seal(obj);
+  for (const c of (only ? [only] : clients)) if (c.connected){ try{ c.publish(topicBase + '/ev', payload, { qos:0 }); }catch(e){} }
 }
-// 整個連線重建（手機切到背景太久，連線伺服器那邊常常已經斷了，但網頁自己不知道）
-function rebuildPeer(){
-  if (!roomCode) return;
-  lastRebuild = Date.now(); connecting = null; tries = [];
-  if (conn){ const old = conn; conn = null; try{ old.close(); }catch(e){} }
-  if (G) setConn(false, isHost ? '正在恢復房間…' : '重新連線中…');
-  if (isHost) openHostPeer(roomCode, false); else openGuestPeer();
+async function onRaw(c, topic, str){
+  const m = await unseal(str); if (!m) return;
+  if (topic.endsWith('/state')){ c.__rev = Math.max(c.__rev, m.rev | 0); onState(m); return; }
+  if (!m.id || seen.has(m.id)) return; seen.add(m.id);
+  if (m.from === CID) return;
+  lastSeenPeer = Date.now();
+  if (m.t === 'chat') addChat(m.name, m.text);
+  if (m.t === 'hello') sendEv({ t:'ping' });
+  updateConn();
 }
-// 心跳：每 4 秒互傳一次，20 秒沒收到就當作斷線並重連；斷超過 20 秒就整個重建連線
-setInterval(() => {
-  if (!roomCode) return;
-  const now = Date.now();
-  if (conn && conn.open){
-    send({ t:'ping' });
-    if (now - lastRecv > 20000){
-      const old = conn; conn = null; try{ old.close(); }catch(e){}
-      setConn(false, '連線不穩，重新連線中…');
-    }
-  }
-  // 只有自己跟連線伺服器的連線真的壞了，才整個重建（不要週期性重建，會把正在建立中的連線砸掉）
-  if (G && !(conn && conn.open) && peer && now - lastRebuild > 30000 &&
-      (peer.destroyed || (peer.disconnected && downSince && now - downSince > 30000))){ rebuildPeer(); return; }
-  ensureLink();
-}, 4000);
+// 心跳：讓對方知道你在線上
+setInterval(() => { if (roomCode && online()) sendEv({ t:'ping' }); updateConn(); }, 8000);
+// 手機切到背景太久回來，連線常常已經壞了：直接重新連
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden'){ hiddenAt = Date.now(); return; }
   if (!roomCode) return;
   const away = hiddenAt ? Date.now() - hiddenAt : 0; hiddenAt = 0;
-  if (away > 20000){ rebuildPeer(); return; }
-  if (conn && conn.open) send({ t:'ping' });
-  ensureLink();
+  if (away > 10000 || !online()) connectRoom(); else sendEv({ t:'hello' });
 });
-addEventListener('pageshow', e => { if (e.persisted && roomCode) rebuildPeer(); });
+addEventListener('pageshow', e => { if (e.persisted && roomCode) connectRoom(); });
+addEventListener('online', () => { if (roomCode) connectRoom(); });
 
-function sameJSON(a, b){ return JSON.stringify(a) === JSON.stringify(b); }
-function acceptGuest(m, c){
-  const alive = conn && conn !== c && conn.open && Date.now() - lastRecv < 30000;
-  if (alive && guestCid && m.cid && m.cid !== guestCid){
-    try{ c.send({ t:'full' }); }catch(e){} setTimeout(() => { try{ c.close(); }catch(e){} }, 500); return;
-  }
-  const old = conn; conn = c; guestCid = m.cid || null; lastRecv = Date.now();
-  if (old && old !== c){ try{ old.close(); }catch(e){} }
-  setConn(true);
-  const name = (m.name || '朋友').slice(0,12), g = m.game;
-  if (!G){
-    if (g && g.history){
-      restoreGame(g, other(g.mySeat)); G.names[other(G.mySeat)] = name;
-      sysChat('已從朋友那邊把棋局補回來');
-    } else {
-      const hs = selColor || (Math.random() < .5 ? 1 : 2);
-      const names = {}; names[hs] = myName(); names[other(hs)] = name;
-      startGame(selGame, selSize, hs, names);
-      sysChat(`${name} 加入了房間`);
-    }
-  } else {
-    // 朋友那邊比較新（例如房主斷線時朋友已經認輸），以朋友的為準
-    if (g && g.type === G.type && sameJSON(g.setup || null, G.setup || null) && g.history.length > G.history.length &&
-        sameJSON(g.history.slice(0, G.history.length), G.history)) restoreGame(g, other(g.mySeat));
-    G.names[other(G.mySeat)] = name;
-    sysChat(`${name} 連回來了`);
-  }
-  send(snapshot()); render();
+function updateConn(){
+  if (!roomCode) return;
+  const on = online();
+  $('conn').className = on ? 'on' : 'off';
+  let t;
+  if (!on) t = '連線中…';
+  else if (!G) t = '已連線 · 房間 ' + roomCode;
+  else t = peerOnline() ? `已連線 · 對方在線 · 房間 ${roomCode}` : `已連線 · 對方目前不在（他回來就會看到你下的棋）`;
+  if ($('connText').textContent !== t){ $('connText').textContent = t; if (G) render(); }
 }
 
-function onMsg(m, c){
-  if (!m || typeof m !== 'object') return;
-  if (m.t === 'hello'){ if (isHost) acceptGuest(m, c); return; }
-  if (c !== conn) return;
-  lastRecv = Date.now();
-  switch (m.t){
-    case 'ping': break;
-    case 'full':
-      conn = null; roomCode = ''; clearSession();
-      if (!G){ lobbyErr('這個房間已經有人在下了。'); $('joinBtn').disabled = false; }
-      else setConn(false, '房間已經有其他人在下了');
-      break;
-    case 'sync':
-      if (isHost) return;
-      { const mine = other(m.hostSeat);
-        const fresh = !G || G.type !== m.type || !sameJSON(G.setup || null, m.setup || null) || m.history.length < G.history.length;
-        restoreGame({ type:m.type, size:m.size, setup:m.setup, history:m.history, names:m.names, phase:m.phase, dead:m.dead, agree:m.agree }, mine);
-        if (fresh) sysChat(`對局開始：${GAME_NAME[G.type]}${G.type === 'go' ? ' ' + G.size + ' 路' : ''}，你是${SEAT_LABEL[G.type][mine]}`);
-        else sysChat('已重新連線，棋局已同步'); }
-      break;
-    case 'act':
-      if (!G) return;
-      if (m.n !== G.history.length){ if (!isHost) send({ t:'needsync' }); else send(snapshot()); return; }
-      doAction(m.a, false);
-      break;
-    case 'needsync': if (isHost && G) send(snapshot()); break;
-    case 'toggle': if (G && G.type === 'go' && G.phase === 'score') toggleDead(m.i, false); break;
-    case 'agree': if (G && G.type === 'go' && G.phase === 'score'){ G.agree[m.c] = true; checkAgree(); render(); } break;
-    case 'resume': if (G && G.type === 'go') resumePlay(false); break;
-    case 'chat': addChat(m.name, m.text); break;
-    case 'rematch': if (isHost) startRematch(); break;
+/* ---------- 房間狀態 ---------- */
+function mySeat(){ if (!R) return 0; for (const k of [1,2]) if (R.players[k] && R.players[k].cid === CID) return k; return 0; }
+function bump(){ R.rev = (R.rev | 0) + 1; R.by = CID; R.t = Date.now(); }
+function gameData(){
+  return { type:G.type, size:G.size, setup:G.setup, history:G.history, phase:G.phase, dead:[...G.dead], agree:G.agree };
+}
+function newGameState(type, size){
+  return { type, size: type === 'xq' ? 0 : size, setup: type === 'bq' ? BQ.makeSetup() : null, history:[], phase:'play', dead:[], agree:{1:false,2:false} };
+}
+// 自己做了動作：更新房間狀態並送上轉送站
+function commit(){
+  if (!R || !G) return;
+  R.game = gameData();
+  const me = mySeat(); if (me) R.players[me].name = myName();
+  bump(); saveSession(); publishState();
+}
+function sameJSON(a, b){ return JSON.stringify(a) === JSON.stringify(b); }
+function onState(s){
+  if (!s || !s.gid || !s.players || !s.game) return;
+  if (R){
+    const newer = s.rev > R.rev || (s.rev === R.rev && s.by !== R.by && String(s.by) > String(R.by));
+    if (!newer){
+      if (s.rev < R.rev) publishState();            // 轉送站上的比較舊，補上自己的
+      return;
+    }
   }
+  clearTimeout(joinTimer);
+  const prev = R; R = s;
+  if (!mySeat()){
+    const empty = [1,2].find(k => !R.players[k]);
+    if (empty && (joining || isHost)){
+      R.players[empty] = { cid:CID, name:myName() };
+      bump(); publishState();
+    } else if (!empty){
+      if (!G){ lobbyErr('這個房間已經有兩個人在下了。'); $('joinBtn').disabled = false; }
+      return;
+    }
+  }
+  saveSession();
+  applyRoom(prev);
+}
+function applyRoom(prev){
+  if (!R) return;
+  const me = mySeat();
+  if (!R.players[1] || !R.players[2]){ if (isHost) showWaitBox(); return; }
+  joining = false;
+  const names = { 1:R.players[1].name, 2:R.players[2].name }, g = R.game;
+  const same = G && prev && prev.gid === R.gid && G.type === g.type && sameJSON(G.setup || null, g.setup || null) &&
+               g.history.length >= G.history.length && sameJSON(g.history.slice(0, G.history.length), G.history);
+  if (same){
+    G.names = names; G.mySeat = me;
+    for (const a of g.history.slice(G.history.length)) doAction(a, false);
+    syncExtras(g);
+  } else {
+    const fresh = !G || !prev || prev.gid !== R.gid;
+    restoreGame(g, me, names);
+    if (fresh) sendEv({ t:'hello' });
+    if (fresh) sysChat(`對局開始：${GAME_NAME[G.type]}${G.type === 'go' ? ' ' + G.size + ' 路' : ''}，你是${SEAT_LABEL[G.type][me]}`);
+  }
+  updateConn(); render();
+}
+function syncExtras(g){
+  if (G.type !== 'go') return;
+  G.dead = new Set(g.dead || []); G.agree = g.agree || {1:false,2:false};
+  if (g.phase === 'play' && G.phase === 'score'){ G.phase = 'play'; G.st.passes = 0; }
+  else if (g.phase === 'score' && G.phase !== 'score' && !G.st.over) G.phase = 'score';
+  else if (g.phase === 'over' && G.phase !== 'over'){ G.phase = 'over'; if (!G.st.over) finishScore(); }
+}
+function restoreGame(g, me, names){
+  startGame(g.type || 'go', g.size, me, { ...names }, g.history || [], g.setup);
+  syncExtras(g);
+  if (G.type === 'go' && g.phase === 'play' && G.st.passes >= 2){ G.phase = 'play'; G.st.passes = 0; }
+}
+
+/* ---------- 開房、加入 ---------- */
+function showWaitBox(){
+  $('roomCode').textContent = roomCode;
+  $('createCard').classList.add('hidden'); $('joinCard').classList.add('hidden'); $('resumeCard').classList.add('hidden');
+  $('waitBox').classList.remove('hidden'); $('createBtn').disabled = false; lobbyErr('');
+}
+$('createBtn').onclick = async () => {
+  if (!needMQTT()) return;
+  lobbyErr(''); $('createBtn').disabled = true;
+  isHost = true; joining = false; roomCode = genCode();
+  await roomKeys(roomCode);
+  const hs = selColor || (Math.random() < .5 ? 1 : 2);
+  R = { rev:1, by:CID, t:Date.now(), gid:rid(), players:{ [hs]:{ cid:CID, name:myName() } }, game:newGameState(selGame, selSize) };
+  setHashFor(roomCode); saveSession(); showWaitBox();
+  connectRoom();
+};
+$('cancelBtn').onclick = () => {
+  disconnectRoom(); isHost = false; roomCode = ''; R = null;
+  clearSession(); clearHash();
+  $('waitBox').classList.add('hidden'); $('createCard').classList.remove('hidden'); $('joinCard').classList.remove('hidden');
+};
+$('copyLinkBtn').onclick = () => copyLink($('copyLinkBtn'), '複製邀請連結');
+$('joinBtn').onclick = async () => {
+  if (!needMQTT()) return;
+  const code = $('joinCode').value.trim().toUpperCase();
+  if (code.length < 5){ lobbyErr('請輸入房間碼'); return; }
+  lobbyErr('連線中…'); $('joinBtn').disabled = true;
+  isHost = false; joining = true; roomCode = code; R = null;
+  await roomKeys(code); setHashFor(code);
+  connectRoom();
+  clearTimeout(joinTimer);
+  joinTimer = setTimeout(() => { if (!G){ lobbyErr('還找不到這個房間，請確認房間碼。（會繼續嘗試）'); $('joinBtn').disabled = false; } }, 12000);
+};
+async function resumeSession(sess){
+  if (!needMQTT()) return;
+  if (sess.name && !$('myName').value) $('myName').value = sess.name;
+  roomCode = sess.code; isHost = !!sess.host; R = sess.R || null; joining = !R;
+  await roomKeys(roomCode); setHashFor(roomCode);
+  if (R){ applyRoom(null); if (G) sysChat('已回到房間 ' + roomCode); }
+  connectRoom();
 }
 
 /* ---------- 連線詳情（排查用） ---------- */
 $('verTag').textContent = '　版本 ' + VERSION;
 $('conn').onclick = () => {
-  const yn = v => v ? '是' : '否';
-  let ice = '—';
-  try{ const pc = (conn || (connecting && connecting.c) || {}).peerConnection; if (pc) ice = pc.iceConnectionState + ' / ' + pc.connectionState; }catch(e){}
+  const name = u => u.replace('wss://', '').split(/[:/]/)[0];
   const lines = [
     `版本：${VERSION}`,
-    `身分：${isHost ? '房主' : '加入者'}　房間：${roomCode || '—'}`,
-    `連線伺服器：${peer ? (peer.destroyed ? '已關閉' : peer.disconnected ? '斷開' : peer.open ? '正常' : '連線中') : '—'}`,
-    `與對方連線：${conn && conn.open ? '已連上' : '未連上'}　嘗試 ${attempts} 次、逾時 ${timeouts} 次`,
-    `網路狀態（ICE）：${ice}`,
-    `最後錯誤：${lastErr || '無'}`,
-    `最後收到對方訊息：${lastRecv ? Math.round((Date.now() - lastRecv) / 1000) + ' 秒前' : '—'}`
+    `房間：${roomCode || '—'}　座位：${mySeat() || '—'}　版本號：${R ? R.rev : '—'}`,
+    ...clients.map(c => `轉送站 ${name(c.__url)}：${c.connected ? '已連上' : '未連上'}`),
+    `對方：${lastSeenPeer ? (peerOnline() ? '在線' : Math.round((Date.now() - lastSeenPeer) / 1000) + ' 秒前在線') : '還沒看到'}`,
+    `最後錯誤：${lastErr || '無'}`
   ];
   showModal('連線詳情', lines.join('\n'), null, '關閉', false);
 };
-$('mText').style.whiteSpace = 'pre-line';
 
 /* ---------- 房間內的按鈕 ---------- */
 $('inviteBtn').onclick = () => copyLink($('inviteBtn'), '邀請連結');
-$('leaveBtn').onclick = () => showModal('離開房間？', '離開後這局不會保留，朋友那邊也會斷線。', () => {
-  roomCode = ''; clearSession(); try{ peer && peer.destroy(); }catch(e){} clearSession();
+$('leaveBtn').onclick = () => showModal('離開房間？', '離開後你這台裝置就不會再回到這局。', () => {
+  roomCode = ''; clearSession(); disconnectRoom(); clearSession();
   location.replace(location.pathname + location.search);
 }, '離開');
 
 /* ---------- game flow ---------- */
-function startGame(type, size, mySeat, names, history=[], setup=null){
-  if (type === 'bq' && !setup) setup = BQ.makeSetup();
+function startGame(type, size, mySeat_, names, history=[], setup=null){
   if (type === 'xq') size = 0;
   const st = type === 'go' ? replay(size, history) : type === 'xq' ? XQ.replay(null, history) : BQ.replay(setup, history);
-  G = { type, size, setup, mySeat, myColor: mySeat, names, history: history.slice(), st,
+  G = { type, size, setup, mySeat: mySeat_, myColor: mySeat_, names, history: history.slice(), st,
         phase:'play', dead:new Set(), agree:{1:false,2:false}, result:'' };
   if (type === 'go'){
     if (st.over){ G.phase = 'over'; const rc = st.resignedBy; G.result = `${colorName(other(rc))}中盤勝（${colorName(rc)}認輸）`; }
@@ -826,7 +787,6 @@ function startGame(type, size, mySeat, names, history=[], setup=null){
   } else if (st.over){ G.phase = 'over'; G.result = resultText(); }
   pending = null; hover = null; sel = null;
   $('lobby').classList.add('hidden'); $('game').classList.remove('hidden');
-  setHash();
   resize(); render();
 }
 function resultText(){
@@ -834,27 +794,24 @@ function resultText(){
   if (!st.winner) return `和局（${st.reason}）`;
   return `${G.names[st.winner]}（${seatSide(st.winner)}）勝 — ${st.reason}`;
 }
-
 function doAction(a, local){
   if (G.phase !== 'play') return false;
-  const n = G.history.length;
   if (G.type !== 'go'){
     const M = G.type === 'xq' ? XQ : BQ;
     const r = M.apply(G.st, a);
     if (!r.ok){ if (local) flashStatus(r.reason); return false; }
     G.history.push(a);
-    if (local) send({ t:'act', a, n });
     if (a.type !== 'resign') clack(r.captured);
     if (G.type === 'bq' && a.type === 'flip' && G.st.moveNo === 1)
       sysChat(`${G.names[1]} 翻到${G.st.seatColor[1] === 1 ? '紅' : '黑'}色，${G.names[1]} 執${seatSide(1)}、${G.names[2]} 執${seatSide(2)}`);
     if (G.st.over){ G.phase = 'over'; G.result = resultText(); sysChat('對局結束：' + G.result); }
-    sel = null; render(); return true;
+    sel = null;
+    if (local) commit();
+    render(); return true;
   }
-  if (G.phase !== 'play' && a.type !== 'resign') return false;
   const r = applyAction(G.st, a);
   if (!r.ok){ if (local) flashStatus(r.reason); return false; }
   G.history.push(a);
-  if (local) send({ t:'act', a, n });
   if (a.type === 'move') clack();
   if (a.type === 'pass') sysChat(`${G.names[other(G.st.turn)]}（${colorName(other(G.st.turn))}）虛手`);
   if (a.type === 'resign'){
@@ -865,10 +822,11 @@ function doAction(a, local){
     G.phase = 'score'; G.dead = new Set(); G.agree = {1:false,2:false};
     sysChat('雙方虛手，進入點目：點擊死子標記，雙方都按「同意結果」即結束。');
   }
-  pending = null; render();
+  pending = null;
+  if (local) commit();
+  render();
   return true;
 }
-
 function toggleDead(i, local){
   const st = G.st;
   if (st.board[i] === EMPTY) return;
@@ -876,26 +834,25 @@ function toggleDead(i, local){
   const isDead = G.dead.has(i);
   for (const s of g.stones){ if (isDead) G.dead.delete(s); else G.dead.add(s); }
   G.agree = {1:false,2:false};
-  if (local) send({ t:'toggle', i });
+  if (local) commit();
   render();
 }
-function checkAgree(){ if (G.agree[1] && G.agree[2]){ G.phase = 'over'; finishScore(); sysChat('終局：' + G.result); } }
+function checkAgree(){ if (G.agree[1] && G.agree[2] && G.phase !== 'over'){ G.phase = 'over'; finishScore(); sysChat('終局：' + G.result); } }
 function finishScore(){
   const s = scoreArea(G.st.board, G.size, G.dead), d = s.diff;
   G.result = `黑 ${s.black} vs 白 ${s.white}（含貼 ${KOMI}）→ ${d > 0 ? '黑' : '白'}勝 ${Math.abs(d)} 目`;
 }
 function resumePlay(local){
   G.phase = 'play'; G.dead = new Set(); G.agree = {1:false,2:false}; G.st.passes = 0;
-  if (local) send({ t:'resume' });
+  if (local) commit();
   sysChat('繼續對局'); render();
 }
 function startRematch(){
   const type = $('rematchGame').value, size = +$('rematchSize').value;
-  const hs = other(G.mySeat);
-  const names = {}; names[hs] = G.names[G.mySeat]; names[other(hs)] = G.names[other(G.mySeat)];
-  startGame(type, size, hs, names);
-  send(snapshot());
-  sysChat(`新的一局：${GAME_NAME[type]}${type === 'go' ? ' ' + size + ' 路' : ''}，你是${SEAT_LABEL[type][hs]}`);
+  R.players = { 1:R.players[2], 2:R.players[1] };   // 先後互換
+  R.gid = rid(); R.game = newGameState(type, size);
+  bump(); saveSession(); publishState();
+  applyRoom(null);
 }
 
 /* ---------- buttons ---------- */
@@ -908,13 +865,10 @@ $('resignBtn').onclick = () => {
   const a = G.type === 'go' ? { type:'resign', color:G.mySeat } : { type:'resign', seat:G.mySeat };
   showModal('確定認輸？', '認輸後本局立即結束。', () => doAction(a, true), '認輸');
 };
-$('agreeBtn').onclick = () => { G.agree[G.mySeat] = true; send({ t:'agree', c:G.mySeat }); checkAgree(); render(); };
+$('agreeBtn').onclick = () => { G.agree[G.mySeat] = true; checkAgree(); commit(); render(); };
 $('resumeBtn').onclick = () => resumePlay(true);
-$('rematchGame').onchange = () => $('rematchSize').classList.toggle('hidden', $('rematchGame').value !== 'go');
-$('rematchBtn').onclick = () => {
-  if (isHost) startRematch();
-  else { send({ t:'rematch' }); flashStatus('已請房主開新局…'); }
-};
+$('rematchGame').onchange = () => { $('rematchGame').dataset.touched = '1'; $('rematchSize').classList.toggle('hidden', $('rematchGame').value !== 'go'); };
+$('rematchBtn').onclick = () => startRematch();
 
 /* ---------- chat ---------- */
 function addChat(name, text){
@@ -931,11 +885,11 @@ $('chatForm').onsubmit = e => {
   e.preventDefault();
   const t = $('chatInput').value.trim(); if (!t) return;
   const name = G ? G.names[G.mySeat] : myName();
-  addChat(name, t); send({ t:'chat', name, text:t }); $('chatInput').value = '';
+  addChat(name, t); sendEv({ t:'chat', name, text:t }); $('chatInput').value = '';
 };
 
 /* ---------- render side panel ---------- */
-function myTurn(){ return G && G.phase === 'play' && G.st.turn === G.mySeat && conn && conn.open; }
+function myTurn(){ return G && G.phase === 'play' && G.st.turn === G.mySeat && online(); }
 let flashTimer = null;
 function flashStatus(t){
   $('status').textContent = t; $('status').className = '';
@@ -967,9 +921,9 @@ function render(){
   $('playActions').classList.toggle('hidden', G.phase !== 'play');
   $('scoreActions').classList.toggle('hidden', G.phase !== 'score');
   $('overActions').classList.toggle('hidden', G.phase !== 'over');
-  $('rematchGame').classList.toggle('hidden', !isHost);
-  $('rematchSize').classList.toggle('hidden', !isHost || $('rematchGame').value !== 'go');
-  $('rematchBtn').textContent = isHost ? '再來一局（先後互換）' : '請房主再開一局';
+  if (G.phase === 'over' && !$('rematchGame').dataset.touched) $('rematchGame').value = G.type;
+  $('rematchSize').classList.toggle('hidden', $('rematchGame').value !== 'go');
+  $('rematchBtn').textContent = '再來一局（先後互換）';
   const s = $('status'); s.className = '';
   const waitTxt = `等待 ${G.names[st.turn]} 下棋…`;
   if (G.phase === 'play'){
@@ -994,11 +948,8 @@ function render(){
       (G.agree[G.mySeat] ? ' 你已同意，等待對方…' : (G.agree[other(G.mySeat)] ? ' 對方已同意。' : ''));
     $('agreeBtn').disabled = G.agree[G.mySeat];
   } else { s.className = 'score'; s.textContent = '對局結束：' + G.result; }
-  saveSession();
-  if (G.phase === 'over' && isHost) $('rematchGame').value = $('rematchGame').dataset.touched ? $('rematchGame').value : G.type;
   draw();
 }
-$('rematchGame').addEventListener('change', () => $('rematchGame').dataset.touched = '1');
 
 /* ---------- canvas ---------- */
 const cv = $('board'), ctx = cv.getContext('2d');
@@ -1170,7 +1121,7 @@ function xqClick(e){
   let vx = Math.round((e.clientX - r.left - geo.mx) / geo.cell), vy = Math.round((e.clientY - r.top - geo.my) / geo.cell);
   if (vx < 0 || vx > 8 || vy < 0 || vy > 9) return;
   const [x, y] = xqView(vx, vy), i = XQ.idx(x, y), st = G.st, p = st.board[i];
-  if (!myTurn()){ flashStatus(conn && conn.open ? '還沒輪到你' : '尚未連線'); return; }
+  if (!myTurn()){ flashStatus(online() ? '還沒輪到你' : '連線中，請稍候'); return; }
   if (p && p.c === G.mySeat){ sel = sel === i ? null : i; draw(); return; }
   if (sel === null){ if (p) flashStatus('請先點選自己的棋子'); return; }
   doAction({ type:'move', from:sel, to:i }, true);
@@ -1200,7 +1151,7 @@ function bqClick(e){
   const x = Math.floor((e.clientX - r.left - geo.mx) / geo.cell), y = Math.floor((e.clientY - r.top - geo.my) / geo.cell);
   if (x < 0 || x > 7 || y < 0 || y > 3) return;
   const i = y * 8 + x, st = G.st, p = st.board[i];
-  if (!myTurn()){ flashStatus(conn && conn.open ? '還沒輪到你' : '尚未連線'); return; }
+  if (!myTurn()){ flashStatus(online() ? '還沒輪到你' : '連線中，請稍候'); return; }
   const mine = st.seatColor[G.mySeat];
   if (p && p.up && mine && p.c === mine){ sel = sel === i ? null : i; draw(); return; }
   if (sel !== null && BQ.targets(st.board, sel).includes(i)){ doAction({ type:'move', from:sel, to:i }, true); return; }
@@ -1234,7 +1185,7 @@ cv.addEventListener('click', e => {
   const p = evtPos(e); if (!p) return;
   if (G.phase === 'score'){ toggleDead(p.y*G.size + p.x, true); return; }
   if (G.phase !== 'play') return;
-  if (!conn || !conn.open){ flashStatus('尚未連線，等對方回來再下'); return; }
+  if (!online()){ flashStatus('連線中，請稍候'); return; }
   if (G.st.turn !== G.mySeat){ flashStatus('還沒輪到你'); return; }
   if ($('confirmTap').checked){
     if (!pending || pending.x !== p.x || pending.y !== p.y){
@@ -1246,37 +1197,25 @@ cv.addEventListener('click', e => {
   doAction({ type:'move', x:p.x, y:p.y }, true);
 });
 
-function resumeSession(sess){
-  if (!needPeerJS()) return;
-  if (sess.name && !$('myName').value) $('myName').value = sess.name;
-  roomCode = sess.code; isHost = sess.role === 'host';
-  if (sess.game){
-    restoreGame(sess.game, sess.game.mySeat);
-    sysChat('已回到房間 ' + roomCode);
-    setConn(false, isHost ? '正在恢復房間…' : '重新連線中…');
-  } else lobbyErr(isHost ? '正在恢復房間…' : '');
-  if (isHost) openHostPeer(roomCode, false); else openGuestPeer();
-}
 (function(){
   const h = location.hash.replace('#', '').trim().toUpperCase();
   const sess = loadSession();
-  if (sess && (sess.game || sess.role === 'host')){
+  if (sess && /^[A-Z0-9]{5,8}$/.test(sess.code)){
     if (h === sess.code){ resumeSession(sess); return; }
     if (!h){
-      const g = sess.game;
-      $('resumeText').textContent = `房間 ${sess.code}` + (g ? `・${GAME_NAME[g.type || 'go']}・已下 ${g.history.length} 手` : '（等待朋友加入中）');
+      const g = sess.R && sess.R.game;
+      $('resumeText').textContent = `房間 ${sess.code}` + (g && sess.R.players[1] && sess.R.players[2] ? `・${GAME_NAME[g.type || 'go']}・已下 ${g.history.length} 手` : '（等待朋友加入中）');
       $('resumeCard').classList.remove('hidden');
-      $('resumeRoomBtn').onclick = () => { $('resumeCard').classList.add('hidden'); setHashFor(sess.code); resumeSession(sess); };
+      $('resumeRoomBtn').onclick = () => { $('resumeCard').classList.add('hidden'); resumeSession(sess); };
       $('dropRoomBtn').onclick = () => { clearSession(); $('resumeCard').classList.add('hidden'); };
     }
   }
-  if (/^[A-Z0-9]{4,6}$/.test(h)){
+  if (/^[A-Z0-9]{5,8}$/.test(h)){
     $('joinCode').value = h;
     $('createCard').classList.add('hidden');
     $('lobby').querySelector('.sub').textContent = '朋友邀請你下棋！輸入名字後按「加入」。';
   }
 })();
-function setHashFor(code){ try{ window.history.replaceState(null, '', location.pathname + location.search + '#' + code); }catch(e){} }
 </script>
 </body>
 </html>
