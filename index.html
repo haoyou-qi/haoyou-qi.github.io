@@ -637,7 +637,7 @@ function handlePeerError(e){
   $('joinBtn').disabled = false; $('createBtn').disabled = false;
   if (e.type === 'peer-unavailable'){
     connecting = null;
-    if (G) setConn(false, '等待房主回來…（會自動重連）');
+    if (G) setConn(false, '房主可能暫時離開頁面，回來後會自動連上…');
     else { lobbyErr('找不到這個房間，請確認房間碼，或請房主重新開房。'); roomCode = ''; }
   } else if (['network','server-error','socket-error','socket-closed','disconnected'].includes(e.type)){
     if (G) setConn(false, '網路中斷，自動重新連線中…'); else lobbyErr('連線伺服器失敗，請稍後再試。');
@@ -663,7 +663,9 @@ function bindConn(c, incoming){
   });
   c.on('error', () => {});
 }
+let downSince = 0, lastRebuild = 0, hiddenAt = 0;
 function setConn(on, text){
+  if (on) downSince = 0; else if (!downSince) downSince = Date.now();
   $('conn').className = on ? 'on' : 'off';
   $('connText').textContent = on ? '已連線 · 房間 ' + roomCode : (text || '未連線');
   if (G) render();
@@ -673,23 +675,37 @@ function snapshot(){
   return { t:'sync', type:G.type, size:G.size, setup:G.setup, history:G.history, names:G.names, hostSeat:G.mySeat,
            phase:G.phase, dead:[...G.dead], agree:G.agree };
 }
-// 心跳：每 4 秒互傳一次，30 秒沒收到就當作斷線並重連
+// 整個連線重建（手機切到背景太久，連線伺服器那邊常常已經斷了，但網頁自己不知道）
+function rebuildPeer(){
+  if (!roomCode) return;
+  lastRebuild = Date.now(); connecting = null;
+  if (conn){ const old = conn; conn = null; try{ old.close(); }catch(e){} }
+  if (G) setConn(false, isHost ? '正在恢復房間…' : '重新連線中…');
+  if (isHost) openHostPeer(roomCode, false); else openGuestPeer();
+}
+// 心跳：每 4 秒互傳一次，20 秒沒收到就當作斷線並重連；斷超過 20 秒就整個重建連線
 setInterval(() => {
   if (!roomCode) return;
+  const now = Date.now();
   if (conn && conn.open){
     send({ t:'ping' });
-    if (Date.now() - lastRecv > 30000){
+    if (now - lastRecv > 20000){
       const old = conn; conn = null; try{ old.close(); }catch(e){}
       setConn(false, '連線不穩，重新連線中…');
     }
   }
+  if (G && !(conn && conn.open) && downSince && now - downSince > 20000 && now - lastRebuild > 30000){ rebuildPeer(); return; }
   ensureLink();
 }, 4000);
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible' || !roomCode) return;
+  if (document.visibilityState === 'hidden'){ hiddenAt = Date.now(); return; }
+  if (!roomCode) return;
+  const away = hiddenAt ? Date.now() - hiddenAt : 0; hiddenAt = 0;
+  if (away > 20000){ rebuildPeer(); return; }
   if (conn && conn.open) send({ t:'ping' });
   ensureLink();
 });
+addEventListener('pageshow', e => { if (e.persisted && roomCode) rebuildPeer(); });
 
 function sameJSON(a, b){ return JSON.stringify(a) === JSON.stringify(b); }
 function acceptGuest(m, c){
